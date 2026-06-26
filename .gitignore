@@ -1,0 +1,7 @@
+
+DATA/
+chroma_db/
+movies_analytics.db
+__pycache__/
+.venv/
+.streamlit/
