@@ -30,7 +30,8 @@ if "chats" not in st.session_state:
             "title": "New Pitch", 
             "messages": [], 
             "pinned": False, 
-            "updated_at": time.time()
+            "updated_at": time.time(),
+            "latest_state": None  # Added to track raw AgentState
         }
     }
     st.session_state.current_chat_id = default_id
@@ -71,9 +72,6 @@ def apply_theme():
             background-image: radial-gradient(ellipse 80% 50% at 50% -10%, rgba(229,9,20,0.08), transparent);
         }}
 
-        /* Keep the header element itself (it hosts the sidebar toggle arrow),
-           but make it transparent and shrink it so it's visually invisible
-           except for the collapse/expand control. */
         header[data-testid="stHeader"] {{
             background: transparent !important;
             background-image: none !important;
@@ -81,20 +79,12 @@ def apply_theme():
             height: 2.5rem !important;
             overflow: visible !important;
         }}
-        /* stToolbar only renders when there's a logo, the sidebar re-expand
-           arrow (data-testid="stExpandSidebarButton"), nav, or right-side
-           content to show — so we keep it visible rather than hiding it
-           wholesale, which previously hid the re-expand arrow along with it.
-           The hamburger menu and deploy decoration are suppressed below via
-           their own selectors instead. */
         [data-testid="stToolbar"] {{
             background: transparent !important;
         }}
         [data-testid="stDecoration"] {{ display: none !important; }}
         #MainMenu {{ visibility: hidden !important; }}
 
-        /* Ensure the sidebar re-expand arrow stays visible & clickable
-           (Streamlit 1.58 testid: stExpandSidebarButton). */
         [data-testid="stExpandSidebarButton"] {{
             visibility: visible !important;
             opacity: 1 !important;
@@ -327,7 +317,8 @@ def call_langgraph_agent(genre, prompt):
             "failed": [] if final_state["status"] == "ACCEPT" else ["Max Revisions Hit"]
         },
         "feedback": final_state["feedback"],
-        "cast": final_state.get("cast", "No casting recommendations available.")
+        "cast": final_state.get("cast", "No casting recommendations available."),
+        "raw_state": final_state # Added to export complete state map
     }
 
 # ==========================================
@@ -355,7 +346,7 @@ def render_sidebar():
             if st.button("➕ NEW PITCH MEETING", use_container_width=True):
                 new_id = str(uuid.uuid4())
                 st.session_state.chats[new_id] = {
-                    "title": "New Pitch", "messages": [], "pinned": False, "updated_at": time.time()
+                    "title": "New Pitch", "messages": [], "pinned": False, "updated_at": time.time(), "latest_state": None
                 }
                 st.session_state.current_chat_id = new_id
                 st.rerun()
@@ -391,7 +382,7 @@ def render_sidebar():
                                 st.session_state.current_chat_id = list(st.session_state.chats.keys())[0]
                             else:
                                 new_id = str(uuid.uuid4())
-                                st.session_state.chats[new_id] = {"title": "New Pitch", "messages": [], "pinned": False, "updated_at": time.time()}
+                                st.session_state.chats[new_id] = {"title": "New Pitch", "messages": [], "pinned": False, "updated_at": time.time(), "latest_state": None}
                                 st.session_state.current_chat_id = new_id
                         st.rerun()
 
@@ -589,6 +580,7 @@ def render_generator_tab():
                     st.markdown("<span class='agent-chip refiner'>🛠️ REFINER — polishing the draft</span>", unsafe_allow_html=True)
                     
                     result = call_langgraph_agent(genre, prompt)
+                    current_chat["latest_state"] = result["raw_state"] # SAVE STATE HERE
                     status.update(label="✅ Pitch Finalized — Greenlit by the Room", state="complete", expanded=False)
                 
                 response_markdown = f"""
@@ -620,19 +612,47 @@ def render_generator_tab():
 </div>
 """
             else:
-                # --- RUN QUICK REVISION (EDIT EXISTING PITCH) ---
-                with st.status("⚡ Script Doctor is revising the draft...", expanded=True) as status:
-                    # Grab the very last thing the AI generated to use as context
-                    last_assistant_msg = next((m["content"] for m in reversed(current_chat["messages"][:-1]) if m["role"] == "assistant"), "")
+                # --- RUN QUICK REVISION (DYNAMIC SUPERVISOR) ---
+                with st.status("⚡ Supervisor is routing your request...", expanded=True) as status:
                     
-                    new_draft = quick_revise(last_assistant_msg, prompt)
-                    status.update(label="✅ Revision Complete", state="complete", expanded=False)
+                    # Fetch the saved state, with a fallback just in case
+                    state_to_edit = current_chat.get("latest_state")
+                    if not state_to_edit:
+                        state_to_edit = {
+                            "prompt": prompt, "draft": "", "revision_count": 0, 
+                            "status": "PENDING", "cast": "", "cast_list": [], "score": None, "quarter": None
+                        }
+
+                    # Execute the upgraded routing engine
+                    new_state = quick_revise(state_to_edit, prompt)
+                    
+                    # Save the newly updated state back to the chat history
+                    current_chat["latest_state"] = new_state
+                    status.update(label="✅ Studio Revisions Complete", state="complete", expanded=False)
                 
+                # Render the dynamically updated components
                 response_markdown = f"""
 <div class="script-card">
 <span class="script-slug">REVISED PITCH — {genre.upper()}</span>
 
-{new_draft}
+{new_state['draft']}
+
+---
+
+**🎭 Updated Casting Recommendations**
+
+{new_state.get('cast', 'No changes to casting.')}
+
+---
+
+**📋 Executive Validation Report**
+
+* **Score:** {new_state.get('score', 'N/A')}
+* **Recommended Quarter:** {new_state.get('quarter', 'N/A')}
+
+**🔍 Latest Critic Feedback:**
+
+> {new_state.get('feedback', 'No new critique requested.')}
 
 </div>
 """

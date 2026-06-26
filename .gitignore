@@ -5,3 +5,5 @@ movies_analytics.db
 __pycache__/
 .venv/
 .streamlit/
+face.constraint
+market_constraints.json
