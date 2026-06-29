@@ -36,7 +36,7 @@ llm_writer = ChatOllama(model="qwen2.5:1.5b", temperature=0.65, top_p=0.9, num_p
 # likely to nail "STATUS: ACCEPT/REJECT", "Score:", "Quarter:" on the first try
 # (fewer malformed outputs for the regex parser) — and lower temperature costs
 # nothing in latency. Short cap since feedback only needs 2-3 sentences.
-llm_critic = ChatOllama(model="qwen2.5:1.5b", temperature=0.1, top_p=0.85, num_predict=300)
+llm_critic = ChatOllama(model="qwen2.5:1.5b", temperature=0.1, top_p=0.85, num_predict=340)
 
 # Refiner: rewriting task — some creativity needed but should stay anchored
 # to the original draft, so a middle-ground temperature.
@@ -158,18 +158,19 @@ def critic_node(state: AgentState):
         "You are a ruthless Hollywood studio executive focused entirely on ROI. "
         "Evaluate the script draft against the provided market constraints. "
         "You must decide whether to 'ACCEPT' or 'REJECT' the draft.\n\n"
-        "RULES:\n"
-        "- If it aligns with the constraints (e.g., uses high-ROI genres), start your response EXACTLY with 'STATUS: ACCEPT'.\n"
-        "- If it fails, start your response EXACTLY with 'STATUS: REJECT'.\n\n"
-        "After the STATUS line, give your reasoning as 6-7 short bullet points (one line each, "
-        "starting with '- '). Each bullet should be a single sharp, specific observation — "
-        "covering things like genre/ROI fit, budget alignment, pacing, character, marketability, "
-        "and (if rejecting) the single most important fix needed. No long paragraphs, no intro "
-        "sentence before the bullets — go straight from the STATUS line into the bullet list.\n\n"
-        "You recommend which Quarter the movie must be realised according to choose genre. "
-        "State this exactly as 'Quarter: Q1' (or Q2/Q3/Q4) on its own line.\n"
-        "And also give the script a score when you 'ACCEPT' or Max revision are reached. "
-        "State this exactly as 'Score: --/10' on its own line.\n"
+        "Your response MUST have exactly three parts, in this order:\n\n"
+        "PART 1 — one line, EXACTLY: 'STATUS: ACCEPT' or 'STATUS: REJECT'.\n\n"
+        "PART 2 — your reasoning as 6-7 short bullet points (one line each, starting "
+        "with '- '). Each bullet should be a single sharp, specific observation — "
+        "covering things like genre/ROI fit, budget alignment, pacing, character, "
+        "marketability, and (if rejecting) the single most important fix needed. "
+        "No long paragraphs, no intro sentence before the bullets.\n\n"
+        "PART 3 — REQUIRED, two more lines after the bullets, in this exact format, "
+        "even if you rejected the script:\n"
+        "Quarter: Q1 (replace with whichever of Q1/Q2/Q3/Q4 best fits this genre)\n"
+        "Score: 7/10 (replace with your actual numeric score out of 10)\n\n"
+        "PART 3 is mandatory on every single response, ACCEPT or REJECT — never skip it, "
+        "and never fold the quarter or score into a bullet point in PART 2 instead.\n\n"
         f"Market Constraints:\n{json.dumps(market_constraints, indent=2)}"
     )
     
@@ -189,6 +190,14 @@ def critic_node(state: AgentState):
 
     score_match = re.search(r"score\s*:\s*([\d.]+\s*/\s*10)", content, re.IGNORECASE)
     quarter_match = re.search(r"quarter\s*:\s*(Q[1-4])", content, re.IGNORECASE)
+
+    # Fallback: if the model still folded these into a prose bullet instead of a
+    # clean "Score:"/"Quarter:" line, try a looser in-text catch before giving up.
+    if not score_match:
+        score_match = re.search(r"\b([\d.]{1,2}\s*/\s*10)\b", content)
+    if not quarter_match:
+        quarter_match = re.search(r"\b(Q[1-4])\b", content)
+
     score = score_match.group(1).replace(" ", "") if score_match else None
     quarter = quarter_match.group(1).upper() if quarter_match else None
 
