@@ -290,9 +290,18 @@ def load_face_data():
 
 def call_langgraph_agent(genre, prompt):
     engine = get_ai_engine()
+    # Give the writer explicit framing about what the critic will actually grade
+    # against (genre ROI fit + budget honesty), so the first draft is more likely
+    # to land an ACCEPT instead of cycling through 2-3 rejections before converging.
     master_prompt = (
         f"Write a {genre} movie pitch. "
-        f"Core idea: {prompt}"
+        f"Core idea: {prompt}\n\n"
+        f"Note for the writer: this pitch will be evaluated by a studio executive "
+        f"against real market ROI data for the '{genre}' genre. Make sure the scale, "
+        f"tone, and stakes of the story honestly match any budget mentioned above "
+        f"(or, if no budget is mentioned, keep the scope modest and contained) — "
+        f"a mismatch between budget and story scale is the most common reason scripts "
+        f"get rejected."
     )
     
     initial_state = {

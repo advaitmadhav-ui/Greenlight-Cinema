@@ -21,8 +21,34 @@ class AgentState(TypedDict):
     quarter: Optional[str]
 
 # 2. Initialize LLM, Local Services, and Data
+# Separate LLM "personas" per agent role — same model, tuned generation params only.
+# CPU-bound inference: every saved output token is real wall-clock time, so
+# num_predict caps are set tight to each agent's actual job. No graph/routing
+# logic is touched anywhere below.
 print("🧠 Booting up Qwen2.5:1.5b via Ollama...")
-llm = ChatOllama(model="qwen2.5:1.5b", temperature=0.7)
+llm = ChatOllama(model="qwen2.5:1.5b", temperature=0.7)  # kept as-is for any external import of `llm`
+
+# Writer: creative prose — needs some temperature headroom, capped length so it
+# doesn't run past 2 paragraphs worth of tokens.
+llm_writer = ChatOllama(model="qwen2.5:1.5b", temperature=0.65, top_p=0.9, num_predict=480)
+
+# Critic: evaluative/format-following task. Lower temperature makes it far more
+# likely to nail "STATUS: ACCEPT/REJECT", "Score:", "Quarter:" on the first try
+# (fewer malformed outputs for the regex parser) — and lower temperature costs
+# nothing in latency. Short cap since feedback only needs 2-3 sentences.
+llm_critic = ChatOllama(model="qwen2.5:1.5b", temperature=0.1, top_p=0.85, num_predict=300)
+
+# Refiner: rewriting task — some creativity needed but should stay anchored
+# to the original draft, so a middle-ground temperature.
+llm_refiner = ChatOllama(model="qwen2.5:1.5b", temperature=0.5, top_p=0.9, num_predict=420)
+
+# Casting: pure selection from a fixed roster, not generation — should be
+# near-deterministic and only needs a couple of short lines.
+llm_casting = ChatOllama(model="qwen2.5:1.5b", temperature=0.25, top_p=0.85, num_predict=200)
+
+# Intent router (used in quick_revise): tiny classification output, needs to
+# be deterministic and fast.
+llm_router = ChatOllama(model="qwen2.5:1.5b", temperature=0.1, num_predict=30)
 
 print("🗄️ Connecting to local ChromaDB using Nomic embeddings...")
 embeddings = OllamaEmbeddings(model="nomic-embed-text")
@@ -78,20 +104,40 @@ def writer_node(state: AgentState):
     )
     user_prompt = f"Prompt: {state['prompt']}\n\nInspiration Context:\n{context}"
     
-    response = llm.invoke([
+    response = llm_writer.invoke([
         SystemMessage(content=sys_msg), 
         HumanMessage(content=user_prompt)
     ])
     
     raw = response.content
 
-    title_match = re.search(r"^\s*Title\s*:\s*(.+?)\s*$", raw, re.IGNORECASE | re.MULTILINE)
+    # Primary: look for the instructed "Title: ..." line, tolerating stray
+    # markdown bolding/asterisks around it (e.g. "**Title:** X" or "*Title*: X").
+    title_match = re.search(
+        r"^\s*\**\s*Title\s*\**\s*:\s*\**\s*(.+?)\s*\**\s*$",
+        raw, re.IGNORECASE | re.MULTILINE
+    )
     if title_match:
         movie_title = title_match.group(1).strip().strip('"').strip("'")
         draft = (raw[:title_match.start()] + raw[title_match.end():]).strip()
     else:
-        movie_title = "Untitled Pitch"
+        # Fallback: the model sometimes skips the "Title:" line and instead
+        # names the movie inline, e.g. '**The Ransom Race** promises...' or
+        # 'titled "The Ransom Race",'. Try to recover it before giving up.
+        movie_title = None
+        inline_patterns = [
+            r'\*\*([A-Z][^*]{2,60})\*\*\s+(?:promises|is|tells|follows|delivers|brings)',
+            r'(?:titled|called)\s+["\u201c]([^"\u201d]{2,60})["\u201d]',
+            r'^["\u201c]([^"\u201d]{2,60})["\u201d]',
+        ]
+        for pattern in inline_patterns:
+            inline_match = re.search(pattern, raw, re.IGNORECASE | re.MULTILINE)
+            if inline_match:
+                movie_title = inline_match.group(1).strip()
+                break
         draft = raw.strip()
+        if not movie_title:
+            movie_title = "Untitled Pitch"
 
     return {"title": movie_title, "draft": draft, "revision_count": state['revision_count']}
 
@@ -114,7 +160,12 @@ def critic_node(state: AgentState):
         "You must decide whether to 'ACCEPT' or 'REJECT' the draft.\n\n"
         "RULES:\n"
         "- If it aligns with the constraints (e.g., uses high-ROI genres), start your response EXACTLY with 'STATUS: ACCEPT'.\n"
-        "- If it fails, start your response EXACTLY with 'STATUS: REJECT' and provide 2-3 sentences of harsh, specific feedback on what to change.\n\n"
+        "- If it fails, start your response EXACTLY with 'STATUS: REJECT'.\n\n"
+        "After the STATUS line, give your reasoning as 6-7 short bullet points (one line each, "
+        "starting with '- '). Each bullet should be a single sharp, specific observation — "
+        "covering things like genre/ROI fit, budget alignment, pacing, character, marketability, "
+        "and (if rejecting) the single most important fix needed. No long paragraphs, no intro "
+        "sentence before the bullets — go straight from the STATUS line into the bullet list.\n\n"
         "You recommend which Quarter the movie must be realised according to choose genre. "
         "State this exactly as 'Quarter: Q1' (or Q2/Q3/Q4) on its own line.\n"
         "And also give the script a score when you 'ACCEPT' or Max revision are reached. "
@@ -122,7 +173,7 @@ def critic_node(state: AgentState):
         f"Market Constraints:\n{json.dumps(market_constraints, indent=2)}"
     )
     
-    response = llm.invoke([
+    response = llm_critic.invoke([
         SystemMessage(content=sys_msg), 
         HumanMessage(content=f"Current Draft:\n{state['draft']}")
     ])
@@ -147,14 +198,35 @@ def critic_node(state: AgentState):
 def refiner_node(state: AgentState):
     print("\n🛠️ REFINER AGENT: Incorporating feedback and rewriting...")
     
+    # state['feedback'] is the critic's raw response, which includes the literal
+    # "STATUS: REJECT" line (and sometimes Score:/Quarter: lines). Feeding that
+    # verbatim primes a small model to keep talking *like* a critic instead of
+    # writing a pitch. Strip those control lines, keep only the actual prose feedback.
+    feedback_lines = state['feedback'].splitlines()
+    clean_feedback = "\n".join(
+        line for line in feedback_lines
+        if not re.match(r"^\s*(STATUS|SCORE|QUARTER)\s*:", line, re.IGNORECASE)
+    ).strip()
+    if not clean_feedback:
+        clean_feedback = "Tighten pacing and strengthen the central conflict."
+
     sys_msg = (
         "You are a highly adaptable script doctor. "
-        "Rewrite the provided draft to perfectly address the studio executive's feedback. "
-        "Do not apologize or explain, just output the newly revised 2-paragraph synopsis."
+        "Rewrite the provided movie pitch draft to address the feedback below.\n\n"
+        "STRICT OUTPUT RULES:\n"
+        "- Output ONLY the revised pitch itself: exactly 2 paragraphs of cinematic prose.\n"
+        "- Do NOT mention budgets, ROI, market constraints, scores, or studio decisions as commentary — "
+        "if the feedback raises one of these, address it BY CHANGING THE STORY, not by writing about it.\n"
+        "- Do NOT include words like 'STATUS', 'REJECT', 'ACCEPT', 'feedback', or any meta-commentary.\n"
+        "- Do not apologize or explain. Output the pitch prose and nothing else."
     )
-    user_prompt = f"Original Draft:\n{state['draft']}\n\nExecutive Feedback:\n{state['feedback']}\n\nRewrite the synopsis:"
+    user_prompt = (
+        f"Original Draft:\n{state['draft']}\n\n"
+        f"Feedback to address (rewrite the STORY to fix this, do not discuss it):\n{clean_feedback}\n\n"
+        "Revised 2-paragraph pitch:"
+    )
     
-    response = llm.invoke([
+    response = llm_refiner.invoke([
         SystemMessage(content=sys_msg), 
         HumanMessage(content=user_prompt)
     ])
@@ -220,19 +292,15 @@ def casting_node(state: AgentState):
         "do not suggest anyone who is not on this list.\n\n"
         f"CANDIDATE ROSTER ({tier_label}, budget tier already selected for you — budget: {budget_note}):\n"
         f"{roster_block}\n\n"
-        "OUTPUT FORMAT (follow exactly, one actor per line, no numbering, no markdown):\n"
+        "OUTPUT FORMAT (follow exactly, one actor per line, no numbering, no markdown, no extra symbols):\n"
         "Name | One-sentence reasoning referencing their ROI figure and fit for the genre.\n\n"
         "INSTRUCTIONS:\n"
         "- Pick 2-3 names from the roster above, spelled exactly as shown.\n"
-        "- Output ONLY the 'Name | reasoning' lines. No intro, no headers, no numbering, no extra commentary.\n"
-        "OUTPUT STYLE Should be:\n"
-        "#-(cast member 1) with his/hers details\n"
-        "#-(cast memebr 2) with his/hers details\n"
-        
+        "- Output ONLY the 'Name | reasoning' lines, nothing before or after them.\n"
     )
     user_prompt = f"Approved Draft:\n{state['draft']}\n\nProvide your casting recommendations from the roster:"
 
-    response = llm.invoke([
+    response = llm_casting.invoke([
         SystemMessage(content=sys_msg),
         HumanMessage(content=user_prompt)
     ])
@@ -320,7 +388,7 @@ def quick_revise(current_state: AgentState, user_request: str) -> AgentState:
         "Example: SCRIPT, CASTING"
     )
     
-    response = llm.invoke([
+    response = llm_router.invoke([
         SystemMessage(content=sys_msg), 
         HumanMessage(content=f"User Request: {user_request}")
     ])
@@ -334,15 +402,27 @@ def quick_revise(current_state: AgentState, user_request: str) -> AgentState:
     new_state['prompt'] = new_state['prompt'] + f" \nRevision Request: {user_request}"
     
     # 2. Targeted Execution: Run only the requested agents
-    if "SYNOPSIS" in intent:
+    if "SCRIPT" in intent:
         print("✍️ REFINER: Editing the draft...")
         refine_sys = (
             "You are an expert Hollywood script doctor. "
-            "Revise the pitch according to the user's instructions. "
-            "Do not include meta-commentary. Output the revised version cleanly."
+            "Revise the pitch to concretely reflect the user's instruction below.\n\n"
+            "IMPORTANT: if the instruction is a fact or number (e.g. a new budget figure, "
+            "a renamed character, a different setting) rather than a narrative note, you must "
+            "still produce a VISIBLY DIFFERENT rewrite that reflects it in the actual prose — "
+            "do not just silently accept the fact without changing anything. For a budget change "
+            "specifically: a bigger budget should read as more spectacle, more locations, larger "
+            "set-pieces; a smaller budget should read as more contained, fewer locations, tighter "
+            "psychological tension. Always rewrite scale/scope language to match.\n\n"
+            "Do not include meta-commentary. Output the revised 2-paragraph pitch cleanly, "
+            "and nothing else."
         )
-        refine_msg = f"CURRENT PITCH:\n{new_state['draft']}\n\nINSTRUCTIONS:\n{user_request}\n\nREVISED PITCH:"
-        res = llm.invoke([SystemMessage(content=refine_sys), HumanMessage(content=refine_msg)])
+        refine_msg = (
+            f"CURRENT PITCH:\n{new_state['draft']}\n\n"
+            f"INSTRUCTION TO APPLY:\n{user_request}\n\n"
+            "Rewrite the pitch now so this instruction is concretely visible in the prose:"
+        )
+        res = llm_refiner.invoke([SystemMessage(content=refine_sys), HumanMessage(content=refine_msg)])
         new_state['draft'] = res.content.strip()
 
     if "CRITIC" in intent:
