@@ -391,6 +391,7 @@ def call_langgraph_agent(genre, prompt):
         "revision_count": 0, 
         "status": "PENDING",
         "cast": "",
+        "cast_list": [],
         "score": None,
         "quarter": None,
     }
@@ -610,6 +611,34 @@ def render_analytics_tab():
 # ==========================================
 # 6. PAGE: CHATBOT PITCH GENERATOR
 # ==========================================
+def generate_cast_html(cast_list):
+    if not cast_list:
+        return "<p style='color: #8a8a8a;'>No casting recommendations available.</p>"
+    
+    html = '<div style="display: flex; flex-direction: column; gap: 12px; margin-top: 10px;">'
+    for actor in cast_list:
+        name = actor.get('name', 'Unknown')
+        
+        # Clean up the ROI string text
+        roi = actor.get('roi_label', '').replace(name, '').strip(' ()')
+        if not roi:
+            roi = "ROI N/A"
+            
+        reasoning = actor.get('reasoning', '')
+        
+        # FLUSHED TO THE LEFT: Removed the image, kept the clean padded card
+        html += f"""<div style="background: #1e1e1e; padding: 16px; border-radius: 8px; border: 1px solid #333333;">
+<div style="color: #ffffff; font-weight: bold; font-size: 16px;">
+{name} <span style="font-size: 12px; color: #7DC4A6; margin-left: 6px; font-weight: normal;">({roi})</span>
+</div>
+<div style="font-size: 13px; color: #b3b3b3; margin-top: 6px; line-height: 1.4;">
+{reasoning}
+</div>
+</div>"""
+
+    html += '</div>'
+    return html
+
 def render_generator_tab():
     current_chat = get_current_chat()
     
@@ -681,6 +710,9 @@ def render_generator_tab():
                     current_chat["latest_state"] = result["raw_state"] # SAVE STATE HERE
                     status.update(label="Pitch Finalized — Greenlit by the Room", state="complete", expanded=False)
                 
+                # Generate custom HTML for the cast list
+                cast_html = generate_cast_html(result['raw_state'].get('cast_list', []))
+                
                 response_markdown = f"""
 <div class="script-card">
 <span class="script-slug">FINAL APPROVED PITCH — {genre.upper()}</span>
@@ -691,7 +723,7 @@ def render_generator_tab():
 
 **Casting Recommendations**
 
-{result['cast']}
+{cast_html}
 
 ---
 
@@ -728,7 +760,9 @@ def render_generator_tab():
                     current_chat["latest_state"] = new_state
                     status.update(label="Studio Revisions Complete", state="complete", expanded=False)
                 
-                # Render the dynamically updated components
+                # Generate custom HTML for the updated cast list
+                cast_html = generate_cast_html(new_state.get('cast_list', []))
+                
                 response_markdown = f"""
 <div class="script-card">
 <span class="script-slug">REVISED PITCH — {genre.upper()}</span>
@@ -739,7 +773,7 @@ def render_generator_tab():
 
 **Updated Casting Recommendations**
 
-{new_state.get('cast', 'No changes to casting.')}
+{cast_html}
 
 ---
 
